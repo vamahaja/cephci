@@ -1,10 +1,10 @@
+import json
 import os
 import random
 import re
 import string
 import tempfile
 from datetime import datetime
-from json import loads
 from subprocess import PIPE, Popen
 from threading import Thread
 from time import sleep
@@ -577,7 +577,7 @@ def get_lvm_on_osd_container(container_id, node, format="json"):
     """
     cmd = f"ceph-volume lvm list --format {format}"
     out, _ = exec_command_on_container(node=node, ctr=container_id, cmd=cmd, sudo=True)
-    return loads(out)
+    return json.loads(out)
 
 
 def get_disk_devlinks(node, disk):
@@ -896,6 +896,27 @@ def create_yaml_config(node, specs):
     return temp_file.name
 
 
+def create_json_config(node, specs, file_path=None, sudo=False):
+    """Create json file from config
+
+    Args:
+        node (ceph): Ceph node
+        specs (dict): Specs
+        file_path (str): File path
+
+    Return: file path
+    """
+    # Create temporory file path
+    if not file_path:
+        file_path = tempfile.NamedTemporaryFile(suffix=".json").name
+
+    # Create temporary file and dump data
+    with node.remote_file(sudo=sudo, file_name=file_path, file_mode="w") as file:
+        json.dump(specs, file)
+
+    return file_path
+
+
 def load_config(config):
     log.info(f"Loading config file - {config}")
     with open(config, "r") as _stream:
@@ -929,3 +950,22 @@ def rename_file(client, mount_point, file_count, windows_client=False):
                 )
         except Exception:
             raise OperationFailedError(f"failed to rename file file{i}")
+
+
+def wait_for_node_to_ready(node, timeout=300, interval=10):
+    """Wait for node to be ready
+
+    Args:
+        node (ceph): Ceph node
+    """
+    _file = tempfile.NamedTemporaryFile().name
+    for w in WaitUntil(timeout=timeout, interval=interval):
+        try:
+            node.download_file("/ceph-qa-ready", _file, sudo=True)
+            return True
+        except Exception:
+            log.error(f"Node {node.hostname} is offline, Retry after {interval} sec")
+
+    if w.expired:
+        log.error(f"Node {node.hostname} is not online after {timeout} sec")
+        return False

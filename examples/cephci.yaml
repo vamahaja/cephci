@@ -1,44 +1,23 @@
 
 credentials:
   subscription:
-    cdn:
-      serverurl: <fake-serverurl>
-      baseurl: <fake-baseurl>
-      username: <fake-username>
-      password: <fake-password>
-      timeout: 60
-      retry: 6
-
-    stage:
-      serverurl: <fake-serverurl>
-      baseurl: <fake-baseurl>
-      username: <fake-username>
-      password: <fake-password>
-      timeout: 60
-      retry: 6
+    serverurl: <fake-serverurl>
+    baseurl: <fake-baseurl>
+    username: <fake-username>
+    password: <fake-password>
+    timeout: 60
+    retry: 6
 
   registry:
     ibm:
-      cp:
-        registry: <fake-registry>
-        username: <fake-username>
-        password: <fake-password>
-
-      stage:
-        registry: <fake-registry>
-        username: <fake-username>
-        password: <fake-password>
+      registry: <fake-registry>
+      username: <fake-username>
+      password: <fake-password>
 
     rh:
-      cdn:
-        registry: <fake-registry>
-        username: <fake-username>
-        password: <fake-password>
-
-      stage:
-        registry: <fake-registry>
-        username: <fake-username>
-        password: <fake-password>
+      registry: <fake-registry>
+      username: <fake-username>
+      password: <fake-password>
 
   cloud:
     openstack:
@@ -70,7 +49,7 @@ credentials:
       prefix: <fake-prefix>
 
 repos:
-  local:
+  production:
     rhel-9:
       - <fake-rhel9-local-appstreap-repo>
       - <fake-rhel9-local-appstreap-repo>
@@ -79,20 +58,7 @@ repos:
       - <fake-rhel8-local-appstreap-repo>
       - <fake-rhel8-local-appstreap-repo>
 
-  stage:
-    rhel-9:
-      - rhel-9-for-x86_64-appstream-rpms
-      - rhel-9-for-x86_64-baseos-rpms
-
-    rhel-8:
-      - rhel-8-for-x86_64-appstream-rpms
-      - rhel-8-for-x86_64-baseos-rpms
-
-    rhel-7:
-      - rhel-7-server-rpms
-      - rhel-7-server-extras-rpms
-
-  cdn:
+  released:
     rhel-9:
       - rhel-9-for-x86_64-appstream-rpms
       - rhel-9-for-x86_64-baseos-rpms

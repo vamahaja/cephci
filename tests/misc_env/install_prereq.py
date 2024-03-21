@@ -1,80 +1,60 @@
 import base64
-import json
+import os
 import re
 import time
 
 from ceph.parallel import parallel
-from ceph.utils import config_ntp, update_ca_cert
+from ceph.utils import config_ntp
 from ceph.waiter import WaitUntil
-from cli.utilities.packages import Package
-from cli.utilities.packages import SubscriptionManager as sm
-from cli.utilities.packages import SubscriptionManagerError
+from cli.exceptions import ConfigError, UnexpectedStateError
+from cli.utilities.configs import (
+    get_configs,
+    get_packages,
+    get_registry_credentials,
+    get_repos,
+    get_subscription_credentials,
+)
+from cli.utilities.packages import Package, Pip, SubscriptionManager
 from cli.utilities.utils import (
+    create_json_config,
     enable_fips_mode,
     is_fips_mode_enabled,
     os_major_version,
     reboot_node,
+    set_service_state,
+    wait_for_node_to_ready,
 )
 from utility.log import Log
-from utility.utils import get_cephci_config
 
 log = Log(__name__)
 
-
-class ConfigNotFoundError(Exception):
-    pass
-
-
-class RepoConfigError(Exception):
-    pass
-
-
-class FIPSConfigError(Exception):
-    pass
-
-
-rpm_packages = {
-    "7": [
-        "wget",
-        "git-core",
-        "python-virtualenv",
-        "python-nose",
-        "ntp",
-        "python2-pip",
-        "chrony",
-    ],
-    "all": [
-        "wget",
-        "git-core",
-        "python3-devel",
-        "chrony",
-        "yum-utils",
-        "net-tools",
-        "lvm2",
-        "podman",
-        "net-snmp-utils",
-        "net-snmp",
-        "kernel-modules-extra",
-        "iproute-tc",
-    ],
-}
-deb_packages = ["wget", "git-core", "python-virtualenv", "lsb-release", "ntp"]
-deb_all_packages = " ".join(deb_packages)
+# Set home user home dir
+CEPHUSER_HOME_DIR = "/home/cephuser"
+ROOT_HOME_DIR = "/root"
 
 
 def run(**kw):
-    log.info("Running test")
+    # DEBUG
+    log.info("Configuring ceph cluster nodes")
+
+    # Get cluster nodes
     ceph_nodes = kw.get("ceph_nodes")
 
-    # skip subscription manager if testing beta RHEL
+    # Get cephci configs
+    get_configs()
+
+    # Get test configs
     config = kw.get("config")
+
+    # Set test configs
     skip_subscription = config.get("skip_subscription", False)
-    enable_eus = config.get("enable_eus", False)
     repo = config.get("add-repo", False)
     skip_enabling_rhel_rpms = config.get("skip_enabling_rhel_rpms", False)
     fips_mode = config.get("enable_fips_mode", False)
-
     cloud_type = config.get("cloud-type", "openstack")
+    build = "ibm" if config.get("ibm_build") else "rh"
+
+    # Start configuring nodes
     with parallel() as p:
         for ceph in ceph_nodes:
             p.spawn(
@@ -82,12 +62,14 @@ def run(**kw):
                 ceph,
                 skip_subscription,
                 repo,
-                enable_eus,
                 skip_enabling_rhel_rpms,
                 cloud_type,
                 fips_mode,
+                build,
             )
-            time.sleep(20)
+
+            # Explicitly wait for 30 sec to get configs effective
+            time.sleep(30)
 
     return 0
 
@@ -96,357 +78,270 @@ def install_prereq(
     ceph,
     skip_subscription=False,
     repo=False,
-    enable_eus=False,
     skip_enabling_rhel_rpms=False,
     cloud_type="openstack",
     fips_mode=False,
+    build="rh",
 ):
-    log.info("Waiting for cloud config to complete on " + ceph.hostname)
-    ceph.exec_command(cmd="while [ ! -f /ceph-qa-ready ]; do sleep 15; done")
-    log.info("cloud config to completed on " + ceph.hostname)
+    # Check for client node
     _is_client = len(ceph.role.role_list) == 1 and "client" in ceph.role.role_list
 
-    # Update certs
-    update_ca_cert(
-        node=ceph,
-        cert_url="https://certs.corp.redhat.com/certs/2015-IT-Root-CA.pem",
-        out_file="RH-IT-Root-CA.crt",
-        check_ec=False,
-    )
+    # Get os major version
+    os_version = os_major_version(ceph)
 
-    # Update CephCI Cert to all nodes. Useful when creating self-signed certificates.
-    update_ca_cert(
-        node=ceph,
-        cert_url="http://magna002.ceph.redhat.com/cephci-jenkins/.cephqe-ca.pem",
-        out_file="cephqe-ca.pem",
-        check_ec=False,
-    )
-    distro_info = ceph.distro_info
-    distro_ver = distro_info["VERSION_ID"]
-    log.info("distro name: {name}".format(name=distro_info["NAME"]))
-    log.info("distro id: {id}".format(id=distro_info["ID"]))
-    log.info(
-        "distro version_id: {version_id}".format(version_id=distro_info["VERSION_ID"])
-    )
+    # Wait for node to get ready
+    wait_for_node_to_ready(ceph)
+
+    # Get distro version
+    distro_ver = ceph.distro_info.get("VERSION_ID")
+
+    # DEBUG
+    log.info(f"Distro Name: {ceph.distro_info.get('NAME')}")
+    log.info(f"Distro ID: {ceph.distro_info.get('ID')}")
+    log.info(f"Distro Version ID: {ceph.distro_info.get('VERSION_ID')}")
 
     # Remove apache-arrow.repo for baremetal
-    cmd_remove_apache_arrow = "sudo rm -f /etc/yum.repos.d/apache-arrow.repo"
-    ceph.exec_command(cmd=cmd_remove_apache_arrow)
+    ceph.remove_file("/etc/yum.repos.d/apache-arrow.repo", sudo=True)
 
     # Max SSH Sessions
-    sshd_configs = [
-        "sed -i '/MaxSessions*/d' /etc/ssh/sshd_config",
-        "echo 'MaxSessions 150' | tee -a /etc/ssh/sshd_config",
-        "systemctl restart sshd",
-    ]
-    for sshd_cfg in sshd_configs:
-        ceph.exec_command(cmd=sshd_cfg, sudo=True)
+    configure_ssh_sessions(ceph)
 
     if ceph.pkg_type == "deb":
-        ceph.exec_command(
-            cmd="sudo apt-get install -y " + deb_all_packages, long_running=True
+        Package(ceph, manager="apt-get").install(
+            ["wget", "git-core", "python-virtualenv", "lsb-release", "ntp"]
         )
+
     else:
         if distro_ver.startswith("7"):
-            ceph.exec_command(cmd="sudo systemctl restart NetworkManager.service")
+            # Restart Network Manager service
+            set_service_state(ceph, "NetworkManager.service", "restart")
 
         if not skip_subscription:
-            if not setup_subscription_manager(ceph, "cdn"):
-                log.info("Trying to subscribe to stage server")
-                setup_subscription_manager(ceph, "stage")
+            setup_subscription_manager(ceph)
 
             status = subscription_manager_status(ceph)
             if status == "Unknown" or skip_enabling_rhel_rpms:
                 log.info("Enabling local RHEL repositories")
                 if not setup_local_repos(ceph):
-                    raise RepoConfigError("Failed to enable local RHEL repositories")
-
-            elif enable_eus:
-                enable_rhel_eus_rpms(ceph, distro_ver)
+                    raise ConfigError("Failed to enable local RHEL repositories")
 
             else:
                 enable_rhel_rpms(ceph, distro_ver)
 
         if repo:
-            setup_addition_repo(ceph, repo)
+            # Add downstream repo
+            Package(ceph).add_repo(repo)
 
-        ceph.exec_command(cmd="sudo yum -y upgrade", check_ec=False)
+            # Update repo metadata
+            Package(ceph).update(metadata=True)
 
-        rpm_all_packages = " ".join(rpm_packages.get("all"))
-        if distro_ver.startswith("7"):
-            rpm_all_packages = " ".join(rpm_packages.get("7"))
+        # Upgrade installed packages
+        Package(ceph).upgrade()
 
-        ceph.exec_command(
-            cmd=f"sudo yum install -y {rpm_all_packages}", long_running=True
-        )
+        # Get pakages to be installed
+        version = f"rhel-{os_version}" if str(os_version) == "7" else None
+        pkgs = get_packages(version)
 
-        # Restarting the node for qdisc filter to be loaded. This is required for
-        # RHEL-8
+        # Install packages
+        Package(ceph).install(pkgs)
+
+        # Restarting the node for qdisc filter to be loaded
         if not distro_ver.startswith("7"):
-            # Avoiding early channel close and ignoring channel exception thrown during
-            # reboot
-            time.sleep(10)
-            ceph.exec_command(sudo=True, cmd="reboot", check_ec=False)
+            reboot_node(ceph)
 
-            # Sleep before and after reconnect
-            time.sleep(60)
-            ceph.reconnect()
-            time.sleep(10)
+        # Install ansible builds
+        if skip_enabling_rhel_rpms and skip_subscription and not _is_client:
+            configure_ansible(ceph, distro_ver)
 
-        if skip_enabling_rhel_rpms and skip_subscription:
-            # Ansible is required for RHCS 4.x
-            if distro_ver.startswith("8") and not _is_client:
-                # TODO(vamahaja): Temporary changes. Revert ansible package with latest epel repo.
-                ansible_pkg = (
-                    "http://download-node-02.eng.bos.redhat.com/nightly/rhel-8/ANSIBLE/latest-ANSIBLE-2-RHEL-8/"
-                    "compose/Base/x86_64/os/Packages/ansible-2.9.27-1.el8ae.noarch.rpm"
-                )
-                ceph.exec_command(
-                    sudo=True,
-                    cmd=f"yum install -y {ansible_pkg}",
-                    check_ec=False,
-                )
-
-            if distro_ver.startswith("7") and not _is_client:
-                ceph.exec_command(
-                    sudo=True,
-                    cmd="yum install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm",
-                    check_ec=False,
-                )
-                ceph.exec_command(sudo=True, cmd="yum install -y ansible-2.9.27-1.el7")
-
+        # Set client packages
         if _is_client:
-            ceph.exec_command(cmd="sudo yum install -y attr gcc", long_running=True)
-            ceph.exec_command(cmd="sudo pip install crefi", long_running=True)
+            # Install tool packages
+            Package(ceph).install(["attr", "gcc"])
 
-        ceph.exec_command(cmd="sudo yum clean all")
+            # Install crefi python package
+            Pip(ceph).install("crefi")
+
+        # Clean repo cache
+        Package(ceph).clean()
+
+        # Configure NTP session
         config_ntp(ceph, cloud_type)
 
-    registry_login(ceph, distro_ver)
+    # Login to container registry
+    registry_login(ceph, distro_ver, build)
+
+    # Update IP tables
     update_iptables(ceph)
 
-    if not fips_mode:
-        return
+    # Setup FIPS mode
+    if fips_mode:
+        setup_fips_mode(ceph)
 
+    return
+
+
+def configure_ansible(node, release):
+    """Install ansible for downstream builds"""
+    # Ansible is required for RHCS 4.x
+    if release.startswith("8"):
+        Package(node).install(
+            "http://download-node-02.eng.bos.redhat.com/nightly/rhel-8/ANSIBLE/latest-ANSIBLE-2-RHEL-8/"
+            "compose/Base/x86_64/os/Packages/ansible-2.9.27-1.el8ae.noarch.rpm"
+        )
+
+    elif release.startswith("7"):
+        # Install ansible epel repo
+        Package(node).install(
+            "https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm",
+            sudo=True,
+        )
+
+        # Install ansible 2.9
+        Package(node).install("ansible-2.9.27-1.el7", sudo=True)
+
+
+def configure_ssh_sessions(node):
+    """Configure SSH session with maximum connections"""
+    # Delete max session config
+    node.exec_command(cmd="sed -i '/MaxSessions*/d' /etc/ssh/sshd_config", sudo=True)
+
+    # Set maximum sessions to 150
+    node.exec_command(
+        cmd="echo 'MaxSessions 150' | tee -a /etc/ssh/sshd_config", sudo=True
+    )
+
+    # Restart SSHD service
+    set_service_state(node, "sshd", "restart")
+
+
+def setup_fips_mode(node):
+    """Setup cluster node with FIPS mode on cluster node"""
     # Enable FIPS mode
-    if not enable_fips_mode(ceph):
-        raise FIPSConfigError("Failed to enable FIPS mode")
+    if not enable_fips_mode(node):
+        raise ConfigError("Failed to enable FIPS mode")
     log.info("Enable FIPS mode config set successfully")
 
     # Restart node and wait
-    reboot_node(ceph)
+    reboot_node(node)
 
     # Check for FIPS mode setting
-    if not is_fips_mode_enabled(ceph):
-        raise FIPSConfigError("FIPS mode not enabled after reboot")
+    if not is_fips_mode_enabled(node):
+        raise ConfigError("FIPS mode not enabled after reboot")
     log.info("FIPS mode is enabled")
 
 
-def setup_addition_repo(ceph, repo):
-    log.info("Adding addition repo {repo} to {sn}".format(repo=repo, sn=ceph.shortname))
-    ceph.exec_command(
-        sudo=True,
-        cmd="curl -o /etc/yum.repos.d/rh_add_repo.repo {repo}".format(repo=repo),
-    )
-    ceph.exec_command(sudo=True, cmd="yum update metadata", check_ec=False)
-
-
-def setup_subscription_manager(ceph, server, timeout=300, interval=60):
-    # Get configuration details from `~/.cephci.yaml`
-    configs = get_cephci_config()
-
-    # Get credentials and validate
-    creds = configs.get(f"{server}_credentials")
-    if not creds:
-        raise ConfigNotFoundError(f"{server} credentials are not provided")
+def setup_subscription_manager(node, timeout=300, interval=60):
+    # Get subscription manager credentials
+    creds = get_subscription_credentials()
 
     # Subscribe to server
     for w in WaitUntil(timeout=timeout, interval=interval):
         try:
-            sm(ceph).register(
+            server = creds.get("serverurl")
+            # Register node to subscription manager
+            SubscriptionManager(node).register(
                 username=creds.get("username"),
                 password=creds.get("password"),
-                serverurl=creds.get("serverurl"),
+                serverurl=server,
                 baseurl=creds.get("baseurl"),
                 force=True,
             )
             log.info(f"Subscribed to {server} server successfully")
             return True
-        except SubscriptionManagerError:
-            log.info(f"Failed to subscribe to {server} server. Retrying")
+        except UnexpectedStateError:
+            log.info(
+                f"Unable to subscribe to {server} server. Retry after {interval} sec"
+            )
 
     if w.expired:
-        log.info(f"Failed to subscribe to {server} server.")
+        log.info(f"Failed to subscribe to {server} server after {timeout} sec")
 
     return False
 
 
 def subscription_manager_status(ceph):
     expr = ".*Overall Status:(.*).*"
-    status = sm(ceph).status()
+    status = SubscriptionManager(ceph).status()
 
     match = re.search(expr, status)
     if not match:
-        raise SubscriptionManagerError("Unexpected subscription manager status")
+        raise UnexpectedStateError("Unexpected subscription manager status")
 
     return match.group(0)
 
 
 def setup_local_repos(ceph):
-    # Get configuration details from `~/.cephci.yaml`
-    configs = get_cephci_config()
-
     # Get distro version
     os_version = os_major_version(ceph)
 
     # Get local repositories
-    repos = configs.get("repo")
-    if not repos:
-        raise ConfigNotFoundError("Repos are not provided")
-
-    # Get local repositories
-    local_repos = repos.get("local", {}).get(f"rhel-{os_version}")
-    if not local_repos:
-        raise ConfigNotFoundError("local repositories are not provided")
+    repos = get_repos("production", f"rhel-{os_version}")
 
     # Add local repositories
-    for repo in local_repos:
+    for repo in repos:
         Package(ceph).add_repo(repo=repo)
 
     log.info("Added local RHEL repos successfully")
     return True
 
 
-def enable_rhel_rpms(ceph, distro_ver):
-    """
-    Setup cdn repositories for rhel systems
-    Args:
-        ceph:       cluster instance
-        distro_ver: distro version details
-    """
+def enable_rhel_rpms(ceph, release):
+    """Setup cdn repositories for RHEL systems"""
+    # Set RHEL release version
+    SubscriptionManager(ceph).release(release)
 
-    repos = {
-        "7": ["rhel-7-server-rpms", "rhel-7-server-extras-rpms"],
-        "8": ["rhel-8-for-x86_64-appstream-rpms", "rhel-8-for-x86_64-baseos-rpms"],
-        "9": ["rhel-9-for-x86_64-appstream-rpms", "rhel-9-for-x86_64-baseos-rpms"],
-    }
+    # Get os major version
+    os_version = os_major_version(ceph)
 
-    ceph.exec_command(sudo=True, cmd=f"subscription-manager release --set {distro_ver}")
+    # Get live repositories
+    repos = get_repos("released", f"rhel-{os_version}")
 
-    for repo in repos.get(distro_ver[0]):
-        ceph.exec_command(
-            sudo=True,
-            cmd="subscription-manager repos --enable={r}".format(r=repo),
-            long_running=True,
-        )
+    # Enable live repos
+    SubscriptionManager(ceph).repos.enable(repos)
+
+    # Clean SM cache
+    Package(ceph).clean()
 
 
-def enable_rhel_eus_rpms(ceph, distro_ver):
-    """
-    Setup cdn repositories for rhel systems
-    reference: http://wiki.test.redhat.com/CEPH/SubscriptionManager
-    Args:
-        distro_ver:     distro version - example: 7.7
-        ceph:           ceph object
-    """
+def registry_login(node, release, build):
+    """Login to container registry"""
+    # Set container package based on RHEL
+    pkg = "docker" if release.startswith("7") else "podman"
 
-    eus_repos = {"7": ["rhel-7-server-eus-rpms", "rhel-7-server-extras-rpms"]}
+    # install container package
+    Package(node).install(pkg)
 
-    for repo in eus_repos.get(distro_ver[0]):
-        ceph.exec_command(
-            sudo=True,
-            cmd="subscription-manager repos --enable={r}".format(r=repo),
-            long_running=True,
-        )
+    # Restart container service
+    set_service_state(node, pkg, "restart")
 
-    rhel_major_version = distro_ver[0]
+    # Get registry credentails
+    reg = get_registry_credentials(build)
 
-    if rhel_major_version == "7":
-        # We only support one EUS release for RHEL 7:
-        release = "7.7"
-    else:
-        raise NotImplementedError("cannot set EUS repos for %s", rhel_major_version)
+    # Encrypt credentials
+    b64_auth = base64.b64encode(f"{reg['username']}:{reg['password']}".encode("ascii"))
 
-    cmd = f"subscription-manager release --set={release}"
+    # Set registry credentials
+    auth = {"auths": {reg["registry"]: {"auth": b64_auth.decode("utf-8")}}}
 
-    ceph.exec_command(
-        sudo=True,
-        cmd=cmd,
-        long_running=True,
-    )
+    # Create cephuser configs
+    cephuser_config_dir = os.path.join(CEPHUSER_HOME_DIR, "docker")
+    cephuser_config_path = os.path.join(cephuser_config_dir, "config.json")
 
-    ceph.exec_command(sudo=True, cmd="yum clean all", long_running=True)
+    # Create root user configs
+    root_config_dir = os.path.join(ROOT_HOME_DIR, "docker")
+    root_config_path = os.path.join(root_config_dir, "config.json")
 
+    # Create docker config directory for users
+    node.create_dirs(root_config_dir, sudo=True)
+    node.create_dirs(cephuser_config_dir)
 
-def registry_login(ceph, distro_ver):
-    """
-    Login to the given Container registries provided in the configuration.
-
-    In this method, docker or podman is installed based on OS.
-    """
-    container = "podman"
-    if distro_ver.startswith("7"):
-        container = "docker"
-
-    ceph.exec_command(
-        cmd="sudo yum install -y {c}".format(c=container), long_running=True
-    )
-
-    if container == "docker":
-        ceph.exec_command(cmd="sudo systemctl restart docker", long_running=True)
-
-    config = get_cephci_config()
-    registries = [
-        {
-            "registry": "registry.redhat.io",
-            "user": config["cdn_credentials"]["username"],
-            "passwd": config["cdn_credentials"]["password"],
-        }
-    ]
-
-    if (
-        config.get("registry_credentials")
-        and config["registry_credentials"]["registry"] != "registry.redhat.io"
-    ):
-        registries.append(
-            {
-                "registry": config["registry_credentials"]["registry"],
-                "user": config["registry_credentials"]["username"],
-                "passwd": config["registry_credentials"]["password"],
-            }
-        )
-    auths = {}
-    for r in registries:
-        b64_auth = base64.b64encode(f"{r['user']}:{r['passwd']}".encode("ascii"))
-        auths[r["registry"]] = {"auth": b64_auth.decode("utf-8")}
-    auths_dict = {"auths": auths}
-    ceph.exec_command(sudo=True, cmd="mkdir -p ~/.docker")
-    ceph.exec_command(cmd="mkdir -p ~/.docker")
-    auths_file_sudo = ceph.remote_file(
-        sudo=True, file_name="/root/.docker/config.json", file_mode="w"
-    )
-    auths_file = ceph.remote_file(
-        file_name="/home/cephuser/.docker/config.json", file_mode="w"
-    )
-    files = [auths_file_sudo, auths_file]
-    for file in files:
-        file.write(json.dumps(auths_dict, indent=4))
-        file.flush()
-        file.close()
+    # Create config files
+    create_json_config(node, auth, cephuser_config_path)
+    create_json_config(node, auth, root_config_path, sudo=True)
 
 
 def update_iptables(node):
-    """update ip-tables rules.
-
-    Drop ip-table rule which matches the list of reject entries,
-     which ensures no side-effects at Ceph configuration.
-
-     Reference:
-     https://docs.ceph.com/en/latest/rados/configuration/network-config-ref/#ip-tables
-
-    Args:
-        node: CephNode object
-    """
+    """Update ip-tables rules"""
     drop_rules = ["INPUT -j REJECT --reject-with icmp-host-prohibited"]
     try:
         out, _ = node.exec_command(cmd="$(which iptables) --list-rules", sudo=True)

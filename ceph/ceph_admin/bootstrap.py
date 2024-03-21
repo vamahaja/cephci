@@ -231,7 +231,7 @@ class BootstrapMixin:
             #       The `set_cdn_tool_repo` should be taken out, once
             #       we have upstream build with all necessary pkg sources.
             self.set_cdn_tool_repo()
-        elif build_type == "released" or custom_repo.lower() == "cdn":
+        elif build_type in ("released", "cdn", "stage") or custom_repo.lower() == "cdn":
             custom_image = False
             self.set_cdn_tool_repo()
             self.cluster.use_cdn = True

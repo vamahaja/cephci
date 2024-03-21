@@ -19,10 +19,6 @@ class ReposError(Exception):
     pass
 
 
-class RpmError(Exception):
-    pass
-
-
 class Package(Cli):
     """This module provides CLI interface for yum/dnf operations"""
 
@@ -68,11 +64,13 @@ class Package(Cli):
             env_vars (dict): dictiory with environment variables
         """
         cmd = ""
+        pkg = pkg if type(pkg) in (list, tuple) else [pkg]
+
         if env_vars:
             for k, v in env_vars.items():
                 cmd += f"{k}={v} "
 
-        cmd += f"{self.manager} install -y {pkg}"
+        cmd += f"{self.manager} install -y {' '.join(pkg)}"
         if nogpgcheck:
             cmd += " --nogpgcheck"
 
@@ -103,13 +101,16 @@ class Package(Cli):
         if out:
             raise PackageError("Failed to remove package " + " ".join(pkgs))
 
-    def upgrade(self, pkg):
+    def upgrade(self, pkg=None):
         """upgrade a package or packages
 
         Args:
             pkg (str): package need to be installed
         """
-        cmd = f"{self.manager} upgrade -y {pkg}"
+        cmd = f"{self.manager} upgrade -y"
+
+        if pkg:
+            cmd += f" {pkg}"
 
         # When multiple nodes are passed, the execute returns a dict with return value
         # for each node Each of these return values has to be checked to ensure that
@@ -118,6 +119,7 @@ class Package(Cli):
         if isinstance(out, dict):
             if not verify_execution_status(out, pkg):
                 raise PackageError("Failed to upgrade package '{pkg}'")
+
         elif out:
             raise PackageError(f"Failed to upgrade package '{pkg}'")
 
@@ -135,6 +137,19 @@ class Package(Cli):
     def clean(self):
         """clean repos"""
         cmd = f"{self.manager} clean all"
+        if self.execute(sudo=True, long_running=True, cmd=cmd):
+            raise PackageError("Failed to clean repositories")
+
+    def update(self, metadata=False):
+        """Update repo metadata
+
+        Args:
+            metadata (bool): Update metadata
+        """
+        cmd = f"{self.manager} update"
+        if metadata:
+            cmd += " metadata"
+
         if self.execute(sudo=True, long_running=True, cmd=cmd):
             raise PackageError("Failed to clean repositories")
 
@@ -165,6 +180,42 @@ class Package(Cli):
             return 0
         else:
             return 1
+
+
+class Pip(Cli):
+    """Interface to perform PIP operations"""
+
+    def __init__(self, nodes, version="pip"):
+        super(Pip, self).__init__(nodes)
+
+        self.base_cmd = version
+
+    def install(self, package):
+        """Install pip packages
+
+        Args:
+            package (str|list): Pip package(s)
+        """
+        package = package if type(package) in (list, tuple) else [package]
+
+        # Install packages
+        cmd = f"{self.base_cmd} install {' '.join(package)}"
+        self.execute(sudo=True, long_running=True, cmd=cmd)
+
+        # Validate packages installed
+        pkgs = self.list()
+        for pkg in package:
+            if pkg not in pkgs:
+                raise PackageError(f"Failed to install package {pkg}")
+
+    def list(self):
+        """List pip packages installed"""
+        cmd = f"{self.base_cmd} list"
+
+        out = self.execute(sudo=True, cmd=cmd)
+        if isinstance(out, tuple):
+            return out[0].strip()
+        return out
 
 
 class SubscriptionManager(Cli):
@@ -217,6 +268,13 @@ class SubscriptionManager(Cli):
         if isinstance(out, tuple):
             return out[0].strip()
         return out
+
+    def release(self, set):
+        """Set subscription manager RHEL release version"""
+        cmd = f"{self.base_cmd} release --set {set}"
+
+        if self.execute(sudo=True, long_running=True, cmd=cmd):
+            raise SubscriptionManagerError(f"Failed to set release {set}")
 
 
 class Repos(Cli):
