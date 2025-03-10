@@ -1,7 +1,10 @@
 import random
 import string
 import traceback
+from threading import Thread
+from time import sleep
 
+from cli.io.small_file import SmallFile
 from tests.cephfs.cephfs_utilsV1 import FsUtils
 from utility.log import Log
 
@@ -262,13 +265,45 @@ def run(ceph_cluster, **kw):
 
 def run_ios(client, mounting_dir):
     def smallfile():
-        client.exec_command(
-            sudo=True,
-            cmd=f"for i in create read append read delete create overwrite rename delete-renamed mkdir rmdir "
-            f"create symlink stat chmod ls-l delete cleanup  ; "
-            f"do python3 /home/cephuser/smallfile/smallfile_cli.py --operation $i --threads 8 --file-size 10240 "
-            f"--files 10 --top {mounting_dir} ; done",
-        )
+        log.info("Starting IO")
+        threads = []
+        for operation in [
+            "create",
+            "read",
+            "append",
+            "read",
+            "delete",
+            "create",
+            "overwrite",
+            "rename",
+            "delete-renamed",
+            "mkdir",
+            "rmdir",
+            "create",
+            "symlink",
+            "stat",
+            "chmod",
+            "ls-l",
+            "delete",
+            "cleanup",
+        ]:
+            th = Thread(
+                target=SmallFile(client).run,
+                args=(
+                    mounting_dir,
+                    operation,
+                    10,
+                    10240,
+                    10,
+                ),
+            )
+            threads.append(th)
+            th.start()
+            #sleep(1)
+
+        for th in threads:
+            th.join()
+        log.info("Completed running IO on all mounts")
 
     def dd():
         client.exec_command(
