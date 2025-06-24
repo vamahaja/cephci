@@ -65,6 +65,7 @@ A simple test suite wrapper that executes tests based on yaml test configuration
         [--osp-cred <file>]
         [--rhs-ceph-repo <repo>]
         [--ubuntu-repo <repo>]
+        [--use-local-rhel-repos]
         [--add-repo <repo>]
         [--kernel-repo <repo>]
         [--store | --reuse <file>]
@@ -117,6 +118,7 @@ Options:
   --platform <rhel-8>               select platform version eg., rhel-8, rhel-7
   --rhs-ceph-repo <repo>            location of rhs-ceph repo
                                     Top level location of compose
+  --use-local-rhel-repos            Use local rhel repos instead of subscription
   --add-repo <repo>                 Any additional repo's need to be enabled
   --ubuntu-repo <repo>              http location of downstream ubuntu repo
   --kernel-repo <repo>              Zstream Kernel Repo location
@@ -442,6 +444,7 @@ def run(args):
     upstream_build = args.get("--upstream-build", None)
 
     base_url = args.get("--rhs-ceph-repo")
+    use_local_rhel_repos = args.get("--use-local-rhel-repos", False)
     ubuntu_repo = args.get("--ubuntu-repo")
     docker_registry = args.get("--docker-registry")
     docker_image = args.get("--docker-image")
@@ -764,6 +767,9 @@ def run(args):
 
             if skip_subscription is True:
                 config["skip_subscription"] = True
+
+            if use_local_rhel_repos is True:
+                config["use_local_rhel_repos"] = True
 
             if config.get("skip_version_compare"):
                 skip_version_compare = config.get("skip_version_compare")

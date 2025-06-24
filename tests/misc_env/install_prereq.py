@@ -6,18 +6,10 @@ import time
 from ceph.parallel import parallel
 from ceph.utils import config_ntp, update_ca_cert
 from ceph.waiter import WaitUntil
-from cli.exceptions import ConfigError
-from cli.utilities.packages import Package
 from cli.utilities.packages import SubscriptionManager as sm
 from cli.utilities.packages import SubscriptionManagerError
-from cli.utilities.utils import (
-    enable_fips_mode,
-    get_service_state,
-    is_fips_mode_enabled,
-    os_major_version,
-    reboot_node,
-    set_service_state,
-)
+from cli.utilities.repos import setup_local_repos
+from cli.utilities.utils import enable_fips_mode, is_fips_mode_enabled, reboot_node
 from utility.log import Log
 from utility.utils import get_cephci_config, is_unsecured_registry
 
@@ -73,6 +65,7 @@ def run(**kw):
     # skip subscription manager if testing beta RHEL
     config = kw.get("config")
     skip_subscription = config.get("skip_subscription", False)
+    use_local_rhel_repos = config.get("use_local_rhel_repos", False)
     enable_eus = config.get("enable_eus", False)
     repo = config.get("add-repo", False)
     skip_enabling_rhel_rpms = config.get("skip_enabling_rhel_rpms", False)
@@ -94,6 +87,7 @@ def run(**kw):
                 repo,
                 enable_eus,
                 skip_enabling_rhel_rpms,
+                use_local_rhel_repos,
                 cloud_type,
                 fips_mode,
                 firewall,
@@ -110,6 +104,7 @@ def install_prereq(
     repo=False,
     enable_eus=False,
     skip_enabling_rhel_rpms=False,
+    use_local_rhel_repos=False,
     cloud_type="openstack",
     fips_mode=False,
     firewall=False,
@@ -164,7 +159,7 @@ def install_prereq(
         if distro_ver.startswith("7"):
             ceph.exec_command(cmd="sudo systemctl restart NetworkManager.service")
 
-        if not skip_subscription:
+        if not (skip_subscription or use_local_rhel_repos):
             if not setup_subscription_manager(ceph, "cdn"):
                 log.info("Trying to subscribe to stage server")
                 setup_subscription_manager(ceph, "stage")
@@ -181,6 +176,11 @@ def install_prereq(
             else:
                 enable_rhel_rpms(ceph, distro_ver)
 
+        if use_local_rhel_repos:
+            log.info("Using local RHEL repositories")
+            if not setup_local_repos(ceph):
+                raise RepoConfigError("Failed to enable local RHEL repositories")
+
         if repo:
             setup_addition_repo(ceph, repo)
 
@@ -191,7 +191,8 @@ def install_prereq(
             rpm_all_packages = " ".join(rpm_packages.get("7"))
 
         ceph.exec_command(
-            cmd=f"sudo yum install -y {rpm_all_packages}", long_running=True
+            cmd=f"sudo yum install -y {rpm_all_packages} --nogpgcheck",
+            long_running=True,
         )
 
         # Restarting the node for qdisc filter to be loaded. This is required for
@@ -230,7 +231,9 @@ def install_prereq(
                 ceph.exec_command(sudo=True, cmd="yum install -y ansible-2.9.27-1.el7")
 
         if _is_client:
-            ceph.exec_command(cmd="sudo yum install -y attr gcc", long_running=True)
+            ceph.exec_command(
+                cmd="sudo yum install -y attr gcc --nogpgcheck", long_running=True
+            )
             ceph.exec_command(cmd="sudo pip install crefi", long_running=True)
 
         ceph.exec_command(cmd="sudo yum clean all")
@@ -315,31 +318,6 @@ def subscription_manager_status(ceph):
     return match.group(0)
 
 
-def setup_local_repos(ceph):
-    # Get configuration details from `~/.cephci.yaml`
-    configs = get_cephci_config()
-
-    # Get distro version
-    os_version = os_major_version(ceph)
-
-    # Get local repositories
-    repos = configs.get("repo")
-    if not repos:
-        raise ConfigNotFoundError("Repos are not provided")
-
-    # Get local repositories
-    local_repos = repos.get("local", {}).get(f"rhel-{os_version}")
-    if not local_repos:
-        raise ConfigNotFoundError("local repositories are not provided")
-
-    # Add local repositories
-    for repo in local_repos:
-        Package(ceph).add_repo(repo=repo)
-
-    log.info("Added local RHEL repos successfully")
-    return True
-
-
 def enable_rhel_rpms(ceph, distro_ver):
     """
     Setup cdn repositories for rhel systems
@@ -412,7 +390,8 @@ def registry_login(ceph, distro_ver, test_data=None):
         container = "docker"
 
     ceph.exec_command(
-        cmd="sudo yum install -y {c}".format(c=container), long_running=True
+        cmd="sudo yum install -y {c} --nogpgcheck".format(c=container),
+        long_running=True,
     )
 
     if container == "docker":
