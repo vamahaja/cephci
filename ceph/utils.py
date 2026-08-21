@@ -35,12 +35,17 @@ from compute.onecloud import (
 )
 from compute.openshift import (
     CephVMNodeOCP,
+    apply_ocpvirt_vm_profile,
     cleanup_precreated_datavolumes,
     create_blank_datavolume,
     ensure_namespace_quota,
     estimate_pvc_requirement,
     non_root_datavolume_names,
     process_ocpvirt_custom_config,
+    resolve_ocpvirt_credentials,
+    resolve_ocpvirt_image_name,
+    validate_ocpvirt_inventory,
+    validate_ocpvirt_node_params,
 )
 from compute.openstack import CephVMNodeV2, NetworkOpFailure, NodeError, VolumeOpFailure
 from utility.log import Log
@@ -1111,28 +1116,22 @@ def create_ocpvirt_ceph_nodes(
     Args:
         cluster_conf: Configuration of cluster (from --global-conf).
         inventory: Instance configuration (image-name, cloud-init setup).
-        ocp_creds: Credential file with globals["ocpvirt-credentials"].
+        ocp_creds: Auth-only credential file with globals["ocpvirt-credentials"].
         run_id: Unique id for the run.
         instances_name: Optional name prefix for instances.
-        custom_config: Optional CLI overrides (pvc_batch_size, vm_batch_size).
+        custom_config: CLI overrides (ocpvirt_namespace, ocpvirt_profile, batch sizes).
     """
     batch_cfg = process_ocpvirt_custom_config(custom_config)
     pvc_batch_size = batch_cfg["pvc_batch_size"]
     vm_batch_size = batch_cfg["vm_batch_size"]
+    profile = batch_cfg.get("ocpvirt_profile")
     log.info(
         "Creating OCP Virtualization instances "
-        f"(pvc_batch_size={pvc_batch_size}, vm_batch_size={vm_batch_size})"
+        f"(pvc_batch_size={pvc_batch_size}, vm_batch_size={vm_batch_size}"
+        + (f", profile={profile}" if profile else "")
+        + ")"
     )
-    glbs = ocp_creds.get("globals")
-    if not glbs:
-        raise NodeError("Missing 'globals' section in OCP Virt credentials file")
-
-    ocp_cred = glbs.get("ocpvirt-credentials")
-    if not ocp_cred:
-        raise NodeError("Missing 'ocpvirt-credentials' section in globals")
-
-    if not ocp_cred.get("server") or not ocp_cred.get("token"):
-        raise NodeError("Missing 'server' and 'token' in ocpvirt-credentials")
+    ocp_cred = resolve_ocpvirt_credentials(ocp_creds, custom_config)
 
     ceph_cluster = cluster_conf.get("ceph-cluster")
     params = dict()
@@ -1143,42 +1142,13 @@ def create_ocpvirt_ceph_nodes(
         with open(inventory_path, "r") as inventory_stream:
             inventory = yaml.safe_load(inventory_stream)
 
-    node_count = 0
-    params["cloud-data"] = inventory.get("instance", {}).get("setup", "")
+    inv_params = validate_ocpvirt_inventory(inventory, ceph_cluster, ocp_cred)
+    inv_params = apply_ocpvirt_vm_profile(inv_params, ocp_cred, custom_config)
+    params.update(inv_params)
     params["ocp-cred"] = ocp_cred
     params["namespace"] = ocp_cred.get("namespace")
     params["storage_class"] = ocp_cred.get("storage_class")
     params["network"] = ocp_cred.get("network", "default")
-
-    if not params["namespace"]:
-        raise NodeError("namespace is required in ocpvirt-credentials")
-    if not params["storage_class"]:
-        raise NodeError("storage_class is required in ocpvirt-credentials")
-
-    inv_create = inventory.get("instance", {}).get("create") or {}
-    if ceph_cluster.get("image-name"):
-        params["image-name"] = ceph_cluster.get("image-name")
-    else:
-        params["image-name"] = inv_create.get("image-name")
-    if not params["image-name"]:
-        raise NodeError(
-            "OCP Virt create: image-name is required in inventory or cluster conf"
-        )
-
-    # VM sizing from inventory (instance.create)
-    params["cpu"] = inv_create.get("cpu", "4")
-    params["memory"] = inv_create.get("memory", "8Gi")
-    params["root_disk_size"] = inv_create.get("root_disk_size", "40Gi")
-    if inv_create.get("vm-size"):
-        # Allow vm-size like "4-8Gi" (cores-memory); overrides cpu/memory when set
-        vm_size = str(inv_create.get("vm-size"))
-        if "-" in vm_size:
-            cores, mem = vm_size.split("-", 1)
-            if cores.strip().isdigit():
-                params["cpu"] = cores.strip()
-            if mem.strip():
-                params["memory"] = mem.strip()
-
     params["cluster-name"] = ceph_cluster.get("name")
     params["root-login"] = True
 
@@ -1221,6 +1191,9 @@ def create_ocpvirt_ceph_nodes(
                 )
             else:
                 node_params["image-name"] = img
+            node_params["image-name"] = resolve_ocpvirt_image_name(
+                node_params["image-name"], ocp_cred
+            )
 
         if node_dict.get("cloud-data"):
             node_params["cloud-data"] = node_dict.get("cloud-data")
@@ -1295,6 +1268,8 @@ def setup_vm_node_ocpvirt(node, ceph_nodes, **params):
     node is removed in exception scope before re-raising.
     """
     vm = None
+    validate_ocpvirt_node_params(params)
+    precreated_volume_names = params["precreated_volume_names"]
     try:
         vm = CephVMNodeOCP(ocp_cred=params["ocp-cred"])
         vm.create(
@@ -1303,12 +1278,10 @@ def setup_vm_node_ocpvirt(node, ceph_nodes, **params):
             cloud_data=params.get("cloud-data", ""),
             size_of_disks=params.get("size-of-disks", 0),
             no_of_volumes=params.get("no-of-volumes", 0),
-            cpu=params.get("cpu"),
-            memory=params.get("memory"),
-            root_disk_size=params.get("root_disk_size"),
             storage_class=params.get("storage_class"),
             network=params.get("network"),
-            precreated_volume_names=params.get("precreated_volume_names"),
+            precreated_volume_names=precreated_volume_names,
+            instancetype=params.get("instancetype"),
         )
         vm.role = params["role"]
         vm.root_login = params["root-login"]
@@ -1321,9 +1294,7 @@ def setup_vm_node_ocpvirt(node, ceph_nodes, **params):
         if vm is not None:
             vm.delete()
         else:
-            cleanup_precreated_datavolumes(
-                params["ocp-cred"], params.get("precreated_volume_names") or []
-            )
+            cleanup_precreated_datavolumes(params["ocp-cred"], precreated_volume_names)
         raise
     except BaseException as be:  # noqa
         log.error(be, exc_info=True)

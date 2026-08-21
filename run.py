@@ -39,7 +39,7 @@ from cli.performance.memory_and_cpu_utils import (
 )
 from compute.aws_ec2 import cleanup_aws_ceph_nodes
 from compute.onecloud import cleanup_onecloud_ceph_nodes, expand_private_key_path
-from compute.openshift import cleanup_ocpvirt_ceph_nodes
+from compute.openshift import cleanup_ocpvirt_ceph_nodes, resolve_ocpvirt_credentials
 from utility import sosreport
 from utility.log import Log
 from utility.polarion import post_to_polarion
@@ -213,6 +213,8 @@ def create_nodes(
 
             --custom-config ibmc_vpc=ci-vpc-01
             --custom-config ibmc_profile=bx2-2x8
+            --custom-config ocpvirt_namespace=rdu3_ceph_jenkins
+            --custom-config ocpvirt_profile=cx1.2xlarge  # optional; default cx1.xlarge
             --custom-config openstack_vm_profile=c1.standard.xl
             --custom-config openstack_networks=provider_net_cci_1
             --custom-config use_ipv6=true
@@ -334,8 +336,7 @@ def create_nodes(
                 look_for_key = True
                 ceph_nodename = node.hostname
             elif cloud_type == "ocpvirt":
-                glbs = osp_cred.get("globals") or {}
-                ocp_cfg = glbs.get("ocpvirt-credentials") or {}
+                ocp_cfg = resolve_ocpvirt_credentials(osp_cred, custom_config)
                 private_key_path = ocp_cfg.get("private_key_path", "")
                 private_ip = node.ip_address
                 look_for_key = bool(private_key_path)

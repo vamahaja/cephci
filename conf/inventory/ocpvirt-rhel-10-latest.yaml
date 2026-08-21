@@ -3,17 +3,13 @@
 # Use with: --cloud ocpvirt --inventory conf/inventory/ocpvirt-rhel-10-latest.yaml
 #
 # Prefer this for RHCS BVTs with --platform rhel-10.
-# Keep cloud-init setup under KubeVirt's 2048-byte inline userdata limit
-# (openshift.py also supports cloudInitNoCloud.secretRef for larger userdata).
+# Short datasource names resolve via datasources in conf/ocpvirt/<name>.yaml.
 
 version_id: "10"
 id: rhel
 instance:
   create:
     image-name: datasource://rhel10
-    cpu: "4"
-    memory: 8Gi
-    root_disk_size: 80Gi
 
   setup: |
     #cloud-config

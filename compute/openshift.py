@@ -6,9 +6,11 @@ import os
 import re
 import tempfile
 from copy import deepcopy
+from pathlib import Path
 from time import sleep
 from typing import Any, Dict, List, Optional
 
+import yaml
 from kubernetes import client
 
 from ceph.parallel import parallel
@@ -18,11 +20,17 @@ from utility.log import Log
 from .exceptions import NodeDeleteFailure, NodeError
 
 LOG = Log(__name__)
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 KUBEVIRT_GROUP = "kubevirt.io"
 KUBEVIRT_VERSION = "v1"
 CDI_GROUP = "cdi.kubevirt.io"
 CDI_VERSION = "v1beta1"
+KUBEVIRT_CLUSTER_INSTANCETYPE_KIND = "VirtualMachineClusterInstancetype"
+INSTANCETYPE_GROUP = "instancetype.kubevirt.io"
+INSTANCETYPE_VERSION = "v1beta1"
+DEFAULT_OCPVIRT_PROFILE = "cx1.xlarge"
+DEFAULT_OCPVIRT_ROOT_DISK_SIZE = "80Gi"
 
 VM_POLL_INTERVAL = 10
 # CSI attach (Trident/NFS) after CDI clone can exceed 20 minutes.
@@ -69,14 +77,11 @@ def _disk_size_str(size_gib: Any, default: str = "40Gi") -> str:
         return default
 
 
-def _image_source(
-    image_name: str, datasource_namespace: Optional[str] = None
-) -> Dict[str, Any]:
+def _image_source(image_name: str) -> Dict[str, Any]:
     """
     Build a CDI DataVolume source from an inventory image-name.
 
-    - datasource://<name> → sourceRef DataSource (namespace from osp-cred)
-    - datasource://<namespace>/<name> → sourceRef DataSource (explicit ns)
+    - datasource://<namespace>/<name> → sourceRef DataSource
     - http(s)://... → HTTP source
     - docker://... or registry path → registry source
     """
@@ -86,18 +91,14 @@ def _image_source(
     image = image_name.strip()
     if image.startswith("datasource://"):
         rest = image[len("datasource://") :].strip("/")
-        if not rest:
-            raise NodeError("datasource image-name must be datasource://<name>")
-        if "/" in rest:
-            ns, name = rest.split("/", 1)
-        else:
-            ns = datasource_namespace
-            name = rest
+        if not rest or "/" not in rest:
+            raise NodeError(
+                "datasource image-name must be datasource://<namespace>/<name>"
+            )
+        ns, name = rest.split("/", 1)
         if not ns or not name:
             raise NodeError(
-                "datasource image-name needs a DataSource name in inventory and "
-                "datasource_namespace in ocpvirt-credentials (or "
-                "datasource://<namespace>/<name>)"
+                "datasource image-name must be datasource://<namespace>/<name>"
             )
         return {
             "_sourceRef": {
@@ -118,7 +119,7 @@ def get_k8s_clients(ocp_cred: dict):
     """
     Return (CustomObjectsApi, CoreV1Api) using bearer token auth from osp-cred.
 
-    Required keys in ocpvirt-credentials: ``server``, ``token``.
+    Required keys: ``server`` (from conf/ocpvirt) and ``token`` (from osp-cred).
     TLS verification is always enabled; set ``certificate_authority_data`` (base64
     CA from kubeconfig) or ``ssl_ca_cert`` (path) when the API uses a custom CA.
 
@@ -155,7 +156,7 @@ def get_k8s_clients(ocp_cred: dict):
     except Exception as exc:
         raise NodeError(
             "Failed to authenticate to the OpenShift/Kubernetes API using "
-            "token and server from ocpvirt-credentials."
+            "token from osp-cred and server from conf/ocpvirt."
         ) from exc
 
 
@@ -198,23 +199,26 @@ def build_virtualmachine_cr(
     image_name: str,
     storage_class: str,
     network: str,
-    cpu: Any,
-    memory: str,
     root_disk_size: str,
+    cpu: Optional[Any] = None,
+    memory: Optional[str] = None,
     cloud_data: str = "",
-    size_of_disks: int = 0,
-    no_of_volumes: int = 0,
     access_modes: Optional[List[str]] = None,
-    datasource_namespace: Optional[str] = None,
     cloudinit_secret_name: Optional[str] = None,
     precreated_volume_names: Optional[List[str]] = None,
+    instancetype_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Build a simple KubeVirt VirtualMachine CR with embedded DataVolume templates.
 
+    Non-root volumes must be pre-created; ``precreated_volume_names`` is required
+    (use an empty list when the VM has no extra disks).
+
     Prefer ``cloudinit_secret_name`` (cloudInitNoCloud.secretRef). Inline
     ``userData`` is capped at 2048 bytes by the KubeVirt admission webhook.
     """
+    precreated_volume_names = validate_precreated_volume_names(precreated_volume_names)
+
     vm_name = _sanitize_k8s_name(node_name)
     root_dv = f"{vm_name}-root"
     cores = _parse_cpu(cpu)
@@ -248,31 +252,15 @@ def build_virtualmachine_cr(
             name=root_dv,
             storage_class=storage_class,
             size=root_size,
-            source=_image_source(image_name, datasource_namespace),
+            source=_image_source(image_name),
             access_modes=modes,
         )
     ]
 
-    if precreated_volume_names is not None:
-        for idx, vol_name in enumerate(precreated_volume_names):
-            disk_name = f"disk-{idx}"
-            disks.append({"name": disk_name, "disk": {"bus": "virtio"}})
-            volumes.append({"name": disk_name, "dataVolume": {"name": vol_name}})
-    else:
-        for idx in range(int(no_of_volumes or 0)):
-            vol_name = f"{vm_name}-vol-{idx}"
-            disk_name = f"disk-{idx}"
-            disks.append({"name": disk_name, "disk": {"bus": "virtio"}})
-            volumes.append({"name": disk_name, "dataVolume": {"name": vol_name}})
-            data_volume_templates.append(
-                build_datavolume_spec(
-                    name=vol_name,
-                    storage_class=storage_class,
-                    size=_disk_size_str(size_of_disks, default="15Gi"),
-                    source=None,
-                    access_modes=modes,
-                )
-            )
+    for idx, vol_name in enumerate(precreated_volume_names):
+        disk_name = f"disk-{idx}"
+        disks.append({"name": disk_name, "disk": {"bus": "virtio"}})
+        volumes.append({"name": disk_name, "dataVolume": {"name": vol_name}})
 
     if not network or network == "default":
         interfaces = [{"name": "default", "masquerade": {}}]
@@ -280,6 +268,42 @@ def build_virtualmachine_cr(
     else:
         interfaces = [{"name": "default", "bridge": {}}]
         networks = [{"name": "default", "multus": {"networkName": network}}]
+
+    domain: Dict[str, Any] = {
+        "devices": {
+            "disks": disks,
+            "interfaces": interfaces,
+            "rng": {},
+        },
+        "features": {"smm": {"enabled": True}},
+        "firmware": {"bootloader": {"efi": {}}},
+    }
+    if not instancetype_name:
+        domain["cpu"] = {"cores": cores}
+        domain["resources"] = {"requests": {"memory": mem}}
+
+    vm_spec: Dict[str, Any] = {
+        "running": True,
+        "dataVolumeTemplates": data_volume_templates,
+        "template": {
+            "metadata": {
+                "labels": {
+                    "kubevirt.io/domain": vm_name,
+                    "app": "cephci",
+                }
+            },
+            "spec": {
+                "domain": domain,
+                "networks": networks,
+                "volumes": volumes,
+            },
+        },
+    }
+    if instancetype_name:
+        vm_spec["instancetype"] = {
+            "kind": KUBEVIRT_CLUSTER_INSTANCETYPE_KIND,
+            "name": instancetype_name,
+        }
 
     return {
         "apiVersion": f"{KUBEVIRT_GROUP}/{KUBEVIRT_VERSION}",
@@ -292,33 +316,7 @@ def build_virtualmachine_cr(
                 "cephci/node-name": vm_name,
             },
         },
-        "spec": {
-            "running": True,
-            "dataVolumeTemplates": data_volume_templates,
-            "template": {
-                "metadata": {
-                    "labels": {
-                        "kubevirt.io/domain": vm_name,
-                        "app": "cephci",
-                    }
-                },
-                "spec": {
-                    "domain": {
-                        "cpu": {"cores": cores},
-                        "resources": {"requests": {"memory": mem}},
-                        "devices": {
-                            "disks": disks,
-                            "interfaces": interfaces,
-                            "rng": {},
-                        },
-                        "features": {"smm": {"enabled": True}},
-                        "firmware": {"bootloader": {"efi": {}}},
-                    },
-                    "networks": networks,
-                    "volumes": volumes,
-                },
-            },
-        },
+        "spec": vm_spec,
     }
 
 
@@ -414,11 +412,300 @@ def ensure_namespace_quota(
         )
 
 
+def validate_precreated_volume_names(
+    precreated_volume_names: Optional[List[str]],
+) -> List[str]:
+    """
+    Validate pre-created non-root DataVolume names for VM attach.
+
+    Args:
+        precreated_volume_names: List of existing DataVolume names. Required;
+            pass an empty list when the VM has no extra volumes.
+
+    Returns:
+        Normalized list copy.
+
+    Raises:
+        NodeError: if ``precreated_volume_names`` is missing or not a list.
+    """
+    if precreated_volume_names is None:
+        raise NodeError(
+            "precreated_volume_names is required for OCP Virt VM create "
+            "(pass [] when no extra volumes are needed)"
+        )
+    if not isinstance(precreated_volume_names, list):
+        raise NodeError("precreated_volume_names must be a list")
+    return list(precreated_volume_names)
+
+
+def validate_ocpvirt_credentials(osp_cred: dict) -> dict:
+    """
+    Validate auth-only ``--osp-cred`` file contents for ``--cloud ocpvirt``.
+
+    Namespace, storage, and network settings belong in ``conf/ocpvirt/<name>.yaml``
+    and are selected via ``--custom-config ocpvirt_namespace=<name>``.
+
+    Args:
+        osp_cred: Parsed osp-cred YAML (must contain globals.ocpvirt-credentials).
+
+    Returns:
+        The validated auth section from ``ocpvirt-credentials``.
+
+    Raises:
+        NodeError: if required sections or keys are missing.
+    """
+    if not osp_cred:
+        raise NodeError("ocpvirt-credentials file is required for --cloud ocpvirt")
+
+    glbs = osp_cred.get("globals")
+    if not glbs:
+        raise NodeError("Missing 'globals' section in OCP Virt credentials file")
+
+    ocp_cfg = glbs.get("ocpvirt-credentials")
+    if not ocp_cfg:
+        raise NodeError("Missing 'ocpvirt-credentials' section in globals")
+
+    if not ocp_cfg.get("token"):
+        raise NodeError("Missing 'token' in ocpvirt-credentials")
+
+    return ocp_cfg
+
+
+def _validate_datasource_url(url: str, label: str) -> None:
+    url_text = str(url).strip()
+    if not url_text.startswith("datasource://"):
+        raise NodeError(f"{label} must start with datasource://")
+    rest = url_text[len("datasource://") :].strip("/")
+    if not rest or "/" not in rest:
+        raise NodeError(f"{label} must be a full datasource://<namespace>/<name> URL")
+
+
+def resolve_ocpvirt_image_name(image_name: str, ocp_cred: dict) -> str:
+    """
+    Resolve inventory image-name to a full datasource URL when needed.
+
+    Short names like ``datasource://rhel9`` are expanded using the ``datasources``
+    map in ``conf/ocpvirt/<name>.yaml``. Inventory may also use the full URL
+    directly: ``datasource://<namespace>/<name>``.
+    """
+    image = str(image_name).strip()
+    if not image.startswith("datasource://"):
+        return image
+
+    rest = image[len("datasource://") :].strip("/")
+    if "/" in rest:
+        _validate_datasource_url(image, "image-name")
+        return image
+
+    datasources = ocp_cred.get("datasources") or {}
+    if not isinstance(datasources, dict):
+        raise NodeError("datasources must be a mapping in conf/ocpvirt/<name>.yaml")
+
+    full_url = datasources.get(rest)
+    if not full_url:
+        raise NodeError(
+            f"inventory image-name {image_name!r} requires a full "
+            f"datasource://<namespace>/<name> URL or datasources.{rest} in "
+            "conf/ocpvirt/<name>.yaml"
+        )
+
+    full_url = str(full_url).strip()
+    _validate_datasource_url(full_url, f"datasources.{rest}")
+    return full_url
+
+
+def validate_ocpvirt_namespace_config(namespace_config: dict) -> dict:
+    """
+    Validate namespace template loaded from ``conf/ocpvirt/<name>.yaml``.
+
+    Raises:
+        NodeError: if required keys are missing.
+    """
+    if not namespace_config:
+        raise NodeError("OCP Virt namespace config file is empty")
+
+    if not namespace_config.get("namespace"):
+        raise NodeError("namespace is required in conf/ocpvirt/<name>.yaml")
+
+    if not namespace_config.get("server"):
+        raise NodeError("server is required in conf/ocpvirt/<name>.yaml")
+
+    if not namespace_config.get("storage_class"):
+        raise NodeError("storage_class is required in conf/ocpvirt/<name>.yaml")
+
+    datasources = namespace_config.get("datasources") or {}
+    if datasources and not isinstance(datasources, dict):
+        raise NodeError("datasources must be a mapping in conf/ocpvirt/<name>.yaml")
+    for key, url in datasources.items():
+        _validate_datasource_url(url, f"datasources.{key}")
+
+    return namespace_config
+
+
+def list_cluster_instancetypes(custom_api) -> List[str]:
+    """Return sorted names of VirtualMachineClusterInstancetypes on the cluster."""
+    resp = custom_api.list_cluster_custom_object(
+        group=INSTANCETYPE_GROUP,
+        version=INSTANCETYPE_VERSION,
+        plural="virtualmachineclusterinstancetypes",
+    )
+    items = resp.get("items") or []
+    return sorted(
+        name for item in items if (name := (item.get("metadata") or {}).get("name"))
+    )
+
+
+def resolve_ocpvirt_instancetype(custom_api, profile_name: str) -> str:
+    """
+    Validate ``ocpvirt_profile`` against cluster VirtualMachineClusterInstancetypes.
+
+    Raises:
+        NodeError: if the profile name does not exist on the cluster.
+    """
+    try:
+        available = list_cluster_instancetypes(custom_api)
+    except Exception as exc:
+        raise NodeError(
+            "Failed to list VirtualMachineClusterInstancetypes on cluster"
+        ) from exc
+    if profile_name not in available:
+        raise NodeError(
+            f"Unknown ocpvirt_profile {profile_name!r}; "
+            f"available instance types: {', '.join(available) or '(none)'}"
+        )
+    return profile_name
+
+
+def apply_ocpvirt_vm_profile(params: dict, ocp_cred: dict, custom_config=None) -> dict:
+    """
+    Apply ``--custom-config ocpvirt_profile=<name>`` using cluster instance types.
+
+    Defaults to ``cx1.xlarge`` when no profile is given. The VM references
+    ``VirtualMachineClusterInstancetype`` instead of inline cpu/memory.
+    """
+    profile_name = process_ocpvirt_custom_config(custom_config)["ocpvirt_profile"]
+    custom_api, _ = get_k8s_clients(ocp_cred)
+    instancetype_name = resolve_ocpvirt_instancetype(custom_api, profile_name)
+    updated = dict(params)
+    updated["instancetype"] = instancetype_name
+    LOG.info(
+        f"Using OCP Virt cluster instance type {instancetype_name} "
+        f"(VirtualMachineClusterInstancetype)"
+    )
+    return updated
+
+
+def load_ocpvirt_namespace_config(custom_config) -> dict:
+    """
+    Load OCP Virt namespace settings from ``conf/ocpvirt/<name>.yaml``.
+
+    The template name comes from ``--custom-config ocpvirt_namespace=<name>``.
+
+    Raises:
+        NodeError: if ``ocpvirt_namespace`` is missing or the file is not found.
+    """
+    from utility.utils import parse_custom_config_list
+
+    overrides = parse_custom_config_list(custom_config)
+    namespace_name = overrides.get("ocpvirt_namespace")
+    if not namespace_name:
+        raise NodeError(
+            "ocpvirt_namespace is required in --custom-config "
+            "(e.g. --custom-config ocpvirt_namespace=rdu3_ceph_jenkins)"
+        )
+
+    platform_conf = REPO_ROOT.joinpath(f"conf/ocpvirt/{namespace_name}.yaml")
+    if not platform_conf.is_file():
+        raise NodeError(
+            f"OCP Virt namespace config not found: {platform_conf}. "
+            f"Expected conf/ocpvirt/{namespace_name}.yaml"
+        )
+
+    with platform_conf.open() as fh:
+        namespace_config = yaml.safe_load(fh) or {}
+
+    return validate_ocpvirt_namespace_config(namespace_config)
+
+
+def merge_ocpvirt_credentials(auth_cred: dict, namespace_config: dict) -> dict:
+    """Merge auth-only osp-cred with a ``conf/ocpvirt`` namespace template."""
+    merged = dict(namespace_config)
+    merged.update(auth_cred)
+    return merged
+
+
+def resolve_ocpvirt_credentials(osp_cred: dict, custom_config=None) -> dict:
+    """
+    Resolve full OCP Virt credentials for API calls and provisioning.
+
+    Combines auth from ``--osp-cred`` with namespace settings from
+    ``conf/ocpvirt/<ocpvirt_namespace>.yaml``.
+    """
+    auth_cred = validate_ocpvirt_credentials(osp_cred)
+    namespace_config = load_ocpvirt_namespace_config(custom_config)
+    return merge_ocpvirt_credentials(auth_cred, namespace_config)
+
+
+def validate_ocpvirt_inventory(
+    inventory: dict, ceph_cluster: dict, ocp_cred: dict
+) -> dict:
+    """
+    Validate inventory and cluster layout for OCP Virt provisioning.
+
+    Args:
+        inventory: Parsed inventory YAML from ``--inventory``.
+        ceph_cluster: ``ceph-cluster`` section from ``--global-conf``.
+        ocp_cred: Validated ``ocpvirt-credentials`` dict.
+
+    Returns:
+        Shared create parameters derived from inventory / cluster conf.
+
+    Raises:
+        NodeError: if required inventory keys are missing or invalid.
+    """
+    if not inventory:
+        raise NodeError("inventory file is required for OCP Virt provisioning")
+
+    instance = inventory.get("instance") or {}
+    inv_create = instance.get("create") or {}
+
+    image_name = ceph_cluster.get("image-name") or inv_create.get("image-name")
+    if not image_name:
+        raise NodeError(
+            "OCP Virt create: image-name is required in inventory or cluster conf"
+        )
+
+    image_name = resolve_ocpvirt_image_name(image_name, ocp_cred)
+
+    params = {
+        "cloud-data": instance.get("setup", ""),
+        "image-name": image_name,
+    }
+
+    return params
+
+
+def validate_ocpvirt_node_params(params: dict) -> None:
+    """
+    Validate per-node provisioning params before OCP Virt VM create.
+
+    Raises:
+        NodeError: if required keys are missing or invalid.
+    """
+    validate_precreated_volume_names(params.get("precreated_volume_names"))
+
+    for key in ("node-name", "image-name", "ocp-cred"):
+        if not params.get(key):
+            raise NodeError(f"{key} is required for OCP Virt node setup")
+
+
 def process_ocpvirt_custom_config(custom_config):
     """
     Parse OCP Virt batch settings from --custom-config.
 
     Supported keys:
+        ocpvirt_namespace: Name of conf/ocpvirt/<name>.yaml (required for create/cleanup).
+        ocpvirt_profile: VirtualMachineClusterInstancetype name (default cx1.xlarge).
         pvc_batch_size (default 3): non-root DataVolumes created per batch.
         vm_batch_size (default 1): VirtualMachines created per batch.
     """
@@ -436,6 +723,7 @@ def process_ocpvirt_custom_config(custom_config):
     return {
         "pvc_batch_size": max(1, pvc_batch_size),
         "vm_batch_size": max(1, vm_batch_size),
+        "ocpvirt_profile": overrides.get("ocpvirt_profile") or DEFAULT_OCPVIRT_PROFILE,
     }
 
 
@@ -571,25 +859,13 @@ def cleanup_ocpvirt_ceph_nodes(osp_cred, pattern, custom_config=None):
     Secret create succeeded but VM create failed).
 
     Args:
-        osp_cred: Global credential file with globals["ocpvirt-credentials"].
+        osp_cred: Auth-only credential file with globals["ocpvirt-credentials"].
         pattern: Substring to match against VM / Secret names.
-        custom_config: Unused; accepted for API parity with other cleanups.
+        custom_config: CLI options; must include ocpvirt_namespace=<name>.
     """
-    del custom_config  # API parity
     LOG.info(f"Destroying existing OCP Virt VMs matching pattern {pattern}")
-    glbs = osp_cred.get("globals") if osp_cred else None
-    if not glbs:
-        raise NodeError("Missing 'globals' section in OCP Virt credentials file")
-
-    ocp_cfg = glbs.get("ocpvirt-credentials")
-    if not ocp_cfg:
-        raise NodeError("Missing 'ocpvirt-credentials' section in globals")
-    if not ocp_cfg.get("server") or not ocp_cfg.get("token"):
-        raise NodeError("Missing 'server' and 'token' in ocpvirt-credentials")
-
-    namespace = ocp_cfg.get("namespace")
-    if not namespace:
-        raise NodeError("Missing 'namespace' in ocpvirt-credentials")
+    ocp_cfg = resolve_ocpvirt_credentials(osp_cred, custom_config)
+    namespace = ocp_cfg["namespace"]
 
     custom_api, core_api = get_k8s_clients(ocp_cfg)
     try:
@@ -792,12 +1068,10 @@ class CephVMNodeOCP:
         cloud_data: str = "",
         size_of_disks: int = 0,
         no_of_volumes: int = 0,
-        cpu: Optional[Any] = None,
-        memory: Optional[str] = None,
-        root_disk_size: Optional[str] = None,
         storage_class: Optional[str] = None,
         network: Optional[str] = None,
         precreated_volume_names: Optional[List[str]] = None,
+        instancetype: Optional[str] = None,
     ) -> None:
         """
         Create a VirtualMachine (and DataVolumes) on OCP Virtualization.
@@ -808,48 +1082,50 @@ class CephVMNodeOCP:
             cloud_data: cloud-init userdata from inventory.
             size_of_disks: Size in GiB for each additional blank disk.
             no_of_volumes: Number of additional blank DataVolumes.
-            cpu / memory / root_disk_size:
-                VM sizing from inventory; defaults applied if omitted.
             storage_class / network:
                 Optional overrides; defaults come from ocpvirt-credentials.
             precreated_volume_names:
-                Optional list of existing blank DataVolume names to attach
-                instead of creating them via dataVolumeTemplates.
+                Required list of existing blank DataVolume names to attach.
+                Pass an empty list when the VM has no extra volumes.
+            instancetype:
+                ``VirtualMachineClusterInstancetype`` name from
+                ``--custom-config ocpvirt_profile=<name>`` (required).
         """
+        if not instancetype:
+            raise NodeError(
+                "instancetype is required for OCP Virt VM create; "
+                "set --custom-config ocpvirt_profile=<name>"
+            )
+        precreated = validate_precreated_volume_names(precreated_volume_names)
+        self._precreated_volumes = precreated
+
         cred = self._ocp_cred
         storage_class = storage_class or cred.get("storage_class")
         network = network if network is not None else cred.get("network", "default")
-        cpu = cpu if cpu is not None else "4"
-        memory = memory or "8Gi"
-        root_disk_size = root_disk_size or "40Gi"
+        root_disk_size = cred.get("root_disk_size") or DEFAULT_OCPVIRT_ROOT_DISK_SIZE
         access_modes = cred.get("access_modes") or ["ReadWriteOnce"]
         if isinstance(access_modes, str):
             access_modes = [access_modes]
-        precreated = list(precreated_volume_names or [])
-        self._precreated_volumes = precreated
 
         if not storage_class:
-            raise NodeError("storage_class is required in ocpvirt-credentials")
+            raise NodeError("storage_class is required in conf/ocpvirt/<name>.yaml")
 
         vm_name = _sanitize_k8s_name(node_name)
         secret_name = _cloudinit_secret_name(vm_name)
         self._ensure_cloudinit_secret(secret_name, cloud_data)
 
+        resolved_image_name = resolve_ocpvirt_image_name(image_name, cred)
         vm_body = build_virtualmachine_cr(
             node_name=node_name,
             namespace=self.namespace,
-            image_name=image_name,
+            image_name=resolved_image_name,
             storage_class=storage_class,
             network=network,
-            cpu=cpu,
-            memory=memory,
             root_disk_size=root_disk_size,
-            size_of_disks=size_of_disks,
-            no_of_volumes=0 if precreated else no_of_volumes,
             access_modes=access_modes,
-            datasource_namespace=cred.get("datasource_namespace"),
             cloudinit_secret_name=secret_name,
-            precreated_volume_names=precreated if precreated else None,
+            precreated_volume_names=precreated,
+            instancetype_name=instancetype,
         )
         LOG.info(f"Creating VirtualMachine {vm_name} in namespace {self.namespace}")
 

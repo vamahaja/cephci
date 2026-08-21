@@ -3,16 +3,13 @@
 # Use with: --cloud ocpvirt --inventory conf/inventory/ocpvirt-rhel-9-latest.yaml
 #
 # Prefer this for IBM Ceph 8.x BVTs with --platform rhel-9 (el9cp host RPMs).
-# Keep cloud-init setup under KubeVirt's 2048-byte inline userdata limit.
+# Short datasource names resolve via datasources in conf/ocpvirt/<name>.yaml.
 
 version_id: "9"
 id: rhel
 instance:
   create:
     image-name: datasource://rhel9
-    cpu: "4"
-    memory: 8Gi
-    root_disk_size: 80Gi
 
   setup: |
     #cloud-config
